@@ -31,7 +31,7 @@ from .normalize import Normalize
 from .pad import Pad
 from .precache import PreCache
 from .print_profiling_stats import PrintProfilingStats
-from .random_location import RandomLocation
+from .random_location import RandomLocation, compute_mask_integral
 from .random_provider import RandomProvider
 from .rasterize_graph import RasterizationSettings, RasterizeGraph
 from .reject import Reject
