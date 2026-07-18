@@ -285,3 +285,36 @@ def test_precomputed_mask_integral_from_npy(tmp_path):
         RandomLocation(min_masked=0.5, mask=m, mask_integral=path), m
     )
     assert stock == mmapped
+
+
+def test_precomputed_mask_integral_zarr_array():
+    # a zarr array (lazy, chunked) is read directly by integrate -> identical
+    zarr = pytest.importorskip("zarr")
+    m = ArrayKey("MASK")
+    integ = compute_mask_integral(MaskSourceRandomLocation(m).data)
+    zarr_integ = zarr.array(integ, chunks=(16, 16, 16))
+    stock = _run_masked_locations(RandomLocation(min_masked=0.5, mask=m), m)
+    zarred = _run_masked_locations(
+        RandomLocation(min_masked=0.5, mask=m, mask_integral=zarr_integ), m
+    )
+    assert stock == zarred
+
+
+def test_precomputed_mask_integral_zarr_store(tmp_path):
+    # a zarr store on disk (opened read-only, chunks read lazily) -> identical
+    zarr = pytest.importorskip("zarr")
+    m = ArrayKey("MASK")
+    integ = compute_mask_integral(MaskSourceRandomLocation(m).data)
+    store = str(tmp_path / "mask_integral.zarr")
+    zarr.save_array(store, integ)
+
+    rl = RandomLocation(min_masked=0.5, mask=m, mask_integral=store)
+    src = MaskSourceRandomLocation(m)
+    with build(src + rl):
+        np.testing.assert_array_equal(np.asarray(rl.mask_integral[:]), integ)
+
+    stock = _run_masked_locations(RandomLocation(min_masked=0.5, mask=m), m)
+    zarred = _run_masked_locations(
+        RandomLocation(min_masked=0.5, mask=m, mask_integral=store), m
+    )
+    assert stock == zarred

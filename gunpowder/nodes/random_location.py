@@ -132,14 +132,49 @@ class RandomLocation(BatchFilter):
         self.ensure_centered = ensure_centered
         self.point_balance_radius = point_balance_radius
         self.random_shift_key = random_shift_key
-        # Optional precomputed integral image of ``mask > 0`` -- an ndarray, or a
-        # path to a ``.npy`` file (loaded read-only via mmap so many worker
-        # processes share a single copy through the OS page cache instead of each
-        # recomputing/holding its own). Must equal ``compute_mask_integral(mask)``
-        # over the mask's full ROI. When given, ``setup()`` skips the expensive
-        # complete-mask read and integral computation. Behavior is otherwise
-        # identical (the integral is a pure function of the mask).
+        # Optional precomputed integral image of ``mask > 0``. May be:
+        #   * an ndarray (or memmap) -- used as-is;
+        #   * a numpy-indexable array-like, e.g. a ``zarr.Array`` (or a
+        #     ``funlib.persistence`` array's ``.data``) -- read lazily, so a large
+        #     mask's integral is never fully materialized per worker (only the few
+        #     corner chunks each masked-location check touches); the natural fit for
+        #     the blockwise/zarr ecosystem;
+        #   * a path to a ``.npy`` file -- loaded read-only via mmap (workers share
+        #     one page-cache copy);
+        #   * a path to a zarr store (``.zarr`` dir) -- opened read-only.
+        # Must equal ``compute_mask_integral(mask)`` over the mask's full ROI. When
+        # given, ``setup()`` skips the expensive complete-mask read + integral
+        # computation; behavior is otherwise identical (the integral is a pure
+        # function of the mask, and ``integrate`` reads it the same way).
         self._mask_integral_arg = mask_integral
+
+    @staticmethod
+    def _resolve_mask_integral(arg):
+        """Resolve the ``mask_integral`` argument to a numpy-indexable array.
+
+        ndarray -> as-is; a ``.npy`` path -> mmap'd read-only; any other path ->
+        opened as a zarr store read-only; anything else is assumed to already be a
+        numpy-indexable array-like (e.g. an open ``zarr.Array``) and used as-is.
+        ``integrate`` then reads it identically to an in-memory integral.
+        """
+        import os
+
+        if isinstance(arg, np.ndarray):
+            logger.info("using provided mask integral array...")
+            return arg
+        if isinstance(arg, (str, os.PathLike)):
+            path = os.fspath(arg)
+            if path.endswith(".npy"):
+                logger.info("memory-mapping mask integral from %s...", path)
+                return np.load(path, mmap_mode="r")
+            import zarr
+
+            logger.info("opening mask integral zarr from %s...", path)
+            return zarr.open(path, mode="r")
+        logger.info(
+            "using provided array-like mask integral (%s)...", type(arg).__name__
+        )
+        return arg
 
     def setup(self):
         upstream = self.get_upstream_provider()
@@ -152,20 +187,9 @@ class RandomLocation(BatchFilter):
             self.mask_spec = self.upstream_spec.array_specs[self.mask]
 
             if self._mask_integral_arg is not None:
-                if isinstance(self._mask_integral_arg, np.ndarray):
-                    logger.info("using provided mask integral array...")
-                    self.mask_integral = self._mask_integral_arg
-                else:
-                    # memory-map read-only: concurrent workers/processes share a
-                    # single copy of the (potentially large) integral via the OS
-                    # page cache instead of each allocating its own.
-                    logger.info(
-                        "memory-mapping precomputed mask integral from %s...",
-                        self._mask_integral_arg,
-                    )
-                    self.mask_integral = np.load(
-                        self._mask_integral_arg, mmap_mode="r"
-                    )
+                self.mask_integral = self._resolve_mask_integral(
+                    self._mask_integral_arg
+                )
             else:
                 logger.info("requesting complete mask...")
 
