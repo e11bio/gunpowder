@@ -20,6 +20,25 @@ from .batch_filter import BatchFilter
 logger = logging.getLogger(__name__)
 
 
+def compute_mask_integral(mask_data):
+    """Integral image of ``mask_data > 0``, using the same dtype policy
+    :class:`RandomLocation` uses internally.
+
+    Precompute this once for a (large) mask, save it with ``np.save``, and pass the
+    path (or the array) as ``RandomLocation(mask=..., min_masked=...,
+    mask_integral=...)`` to skip the per-node/per-worker recomputation. The result
+    is bit-identical to what ``RandomLocation`` would compute, so masked-location
+    selection is unchanged.
+    """
+    mask_integral_dtype = np.uint64
+    if mask_data.size < 2**32:
+        mask_integral_dtype = np.uint32
+    if mask_data.size < 2**16:
+        mask_integral_dtype = np.uint16
+    integral = np.array(mask_data > 0, dtype=mask_integral_dtype)
+    return integral_image(integral).astype(mask_integral_dtype)
+
+
 class RandomLocation(BatchFilter):
     """Choses a batch at a random location in the bounding box of the upstream
     provider.
@@ -104,6 +123,7 @@ class RandomLocation(BatchFilter):
         ensure_centered=None,
         point_balance_radius=1,
         random_shift_key=None,
+        mask_integral=None,
     ):
         self.min_masked = min_masked
         self.mask = mask
@@ -112,6 +132,49 @@ class RandomLocation(BatchFilter):
         self.ensure_centered = ensure_centered
         self.point_balance_radius = point_balance_radius
         self.random_shift_key = random_shift_key
+        # Optional precomputed integral image of ``mask > 0``. May be:
+        #   * an ndarray (or memmap) -- used as-is;
+        #   * a numpy-indexable array-like, e.g. a ``zarr.Array`` (or a
+        #     ``funlib.persistence`` array's ``.data``) -- read lazily, so a large
+        #     mask's integral is never fully materialized per worker (only the few
+        #     corner chunks each masked-location check touches); the natural fit for
+        #     the blockwise/zarr ecosystem;
+        #   * a path to a ``.npy`` file -- loaded read-only via mmap (workers share
+        #     one page-cache copy);
+        #   * a path to a zarr store (``.zarr`` dir) -- opened read-only.
+        # Must equal ``compute_mask_integral(mask)`` over the mask's full ROI. When
+        # given, ``setup()`` skips the expensive complete-mask read + integral
+        # computation; behavior is otherwise identical (the integral is a pure
+        # function of the mask, and ``integrate`` reads it the same way).
+        self._mask_integral_arg = mask_integral
+
+    @staticmethod
+    def _resolve_mask_integral(arg):
+        """Resolve the ``mask_integral`` argument to a numpy-indexable array.
+
+        ndarray -> as-is; a ``.npy`` path -> mmap'd read-only; any other path ->
+        opened as a zarr store read-only; anything else is assumed to already be a
+        numpy-indexable array-like (e.g. an open ``zarr.Array``) and used as-is.
+        ``integrate`` then reads it identically to an in-memory integral.
+        """
+        import os
+
+        if isinstance(arg, np.ndarray):
+            logger.info("using provided mask integral array...")
+            return arg
+        if isinstance(arg, (str, os.PathLike)):
+            path = os.fspath(arg)
+            if path.endswith(".npy"):
+                logger.info("memory-mapping mask integral from %s...", path)
+                return np.load(path, mmap_mode="r")
+            import zarr
+
+            logger.info("opening mask integral zarr from %s...", path)
+            return zarr.open(path, mode="r")
+        logger.info(
+            "using provided array-like mask integral (%s)...", type(arg).__name__
+        )
+        return arg
 
     def setup(self):
         upstream = self.get_upstream_provider()
@@ -123,26 +186,20 @@ class RandomLocation(BatchFilter):
             )
             self.mask_spec = self.upstream_spec.array_specs[self.mask]
 
-            logger.info("requesting complete mask...")
+            if self._mask_integral_arg is not None:
+                self.mask_integral = self._resolve_mask_integral(
+                    self._mask_integral_arg
+                )
+            else:
+                logger.info("requesting complete mask...")
 
-            mask_request = BatchRequest({self.mask: self.mask_spec})
-            mask_batch = upstream.request_batch(mask_request)
+                mask_request = BatchRequest({self.mask: self.mask_spec})
+                mask_batch = upstream.request_batch(mask_request)
 
-            logger.info("allocating mask integral array...")
+                logger.info("allocating mask integral array...")
 
-            mask_data = mask_batch.arrays[self.mask].data
-            mask_integral_dtype = np.uint64
-            logger.debug("mask size is %s", mask_data.size)
-            if mask_data.size < 2**32:
-                mask_integral_dtype = np.uint32
-            if mask_data.size < 2**16:
-                mask_integral_dtype = np.uint16
-            logger.debug("chose %s as integral array dtype", mask_integral_dtype)
-
-            self.mask_integral = np.array(mask_data > 0, dtype=mask_integral_dtype)
-            self.mask_integral = integral_image(self.mask_integral).astype(
-                mask_integral_dtype
-            )
+                mask_data = mask_batch.arrays[self.mask].data
+                self.mask_integral = compute_mask_integral(mask_data)
 
         if self.ensure_nonempty:
             assert self.ensure_nonempty in self.upstream_spec, (

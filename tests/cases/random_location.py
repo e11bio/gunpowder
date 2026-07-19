@@ -13,6 +13,7 @@ from gunpowder import (
     RandomLocation,
     Roi,
     build,
+    compute_mask_integral,
 )
 from gunpowder.pipeline import PipelineRequestError
 
@@ -191,3 +192,129 @@ def test_impossible():
                     }
                 )
             )
+
+
+class MaskSourceRandomLocation(BatchProvider):
+    """Provides a binary mask with a masked-in cube, for min_masked tests."""
+
+    def __init__(self, key, shape=(40, 40, 40), voxel_size=(1, 1, 1)):
+        self.key = key
+        self.voxel_size = Coordinate(voxel_size)
+        self.roi = Roi((0, 0, 0), Coordinate(shape) * self.voxel_size)
+        self.data = np.zeros(shape, dtype=np.uint8)
+        self.data[8:32, 8:32, 8:32] = 1  # masked-in cube
+
+    def setup(self):
+        self.provides(
+            self.key,
+            ArraySpec(roi=self.roi, voxel_size=self.voxel_size, interpolatable=False),
+        )
+
+    def provide(self, request):
+        batch = Batch()
+        roi = request[self.key].roi
+        start = roi.begin / self.voxel_size
+        end = roi.end / self.voxel_size
+        data_slices = tuple(map(slice, start, end))
+        spec = self.spec[self.key].copy()
+        spec.roi = roi
+        batch[self.key] = Array(self.data[data_slices].copy(), spec)
+        return batch
+
+
+def test_precomputed_mask_integral_matches_internal():
+    # the integral RandomLocation builds internally must equal compute_mask_integral
+    m = ArrayKey("MASK")
+    src = MaskSourceRandomLocation(m)
+    rl = RandomLocation(min_masked=0.5, mask=m)
+    with build(src + rl):
+        internal = np.asarray(rl.mask_integral)
+    expected = compute_mask_integral(src.data)
+    np.testing.assert_array_equal(internal, expected)
+    assert internal.dtype == expected.dtype
+
+
+def _run_masked_locations(rl, m, n=20):
+    pipeline = MaskSourceRandomLocation(m) + rl
+    sums = []
+    with build(pipeline):
+        for i in range(n):
+            batch = pipeline.request_batch(
+                BatchRequest(
+                    {m: ArraySpec(roi=Roi((0, 0, 0), (8, 8, 8)))},
+                    random_seed=100 + i,
+                )
+            )
+            sums.append(int(batch[m].data.sum()))
+    return sums
+
+
+def test_precomputed_mask_integral_array_identical_behavior():
+    # passing a precomputed integral array must give bit-identical placements to
+    # letting RandomLocation compute it (the integral is a pure function of mask)
+    m = ArrayKey("MASK")
+    precomputed = compute_mask_integral(MaskSourceRandomLocation(m).data)
+    stock = _run_masked_locations(RandomLocation(min_masked=0.5, mask=m), m)
+    pre = _run_masked_locations(
+        RandomLocation(min_masked=0.5, mask=m, mask_integral=precomputed), m
+    )
+    assert stock == pre
+    assert min_masked_ok(pre)
+
+
+def min_masked_ok(sums):
+    # min_masked=0.5 over an 8^3 window -> at least half masked -> nonzero sum
+    return all(s > 0 for s in sums)
+
+
+def test_precomputed_mask_integral_from_npy(tmp_path):
+    # a .npy path is memory-mapped read-only and behaves identically
+    m = ArrayKey("MASK")
+    precomputed = compute_mask_integral(MaskSourceRandomLocation(m).data)
+    path = str(tmp_path / "mask_integral.npy")
+    np.save(path, precomputed)
+
+    rl = RandomLocation(min_masked=0.5, mask=m, mask_integral=path)
+    src = MaskSourceRandomLocation(m)
+    with build(src + rl):
+        assert isinstance(rl.mask_integral, np.memmap)  # shared via page cache
+        np.testing.assert_array_equal(np.asarray(rl.mask_integral), precomputed)
+
+    stock = _run_masked_locations(RandomLocation(min_masked=0.5, mask=m), m)
+    mmapped = _run_masked_locations(
+        RandomLocation(min_masked=0.5, mask=m, mask_integral=path), m
+    )
+    assert stock == mmapped
+
+
+def test_precomputed_mask_integral_zarr_array():
+    # a zarr array (lazy, chunked) is read directly by integrate -> identical
+    zarr = pytest.importorskip("zarr")
+    m = ArrayKey("MASK")
+    integ = compute_mask_integral(MaskSourceRandomLocation(m).data)
+    zarr_integ = zarr.array(integ, chunks=(16, 16, 16))
+    stock = _run_masked_locations(RandomLocation(min_masked=0.5, mask=m), m)
+    zarred = _run_masked_locations(
+        RandomLocation(min_masked=0.5, mask=m, mask_integral=zarr_integ), m
+    )
+    assert stock == zarred
+
+
+def test_precomputed_mask_integral_zarr_store(tmp_path):
+    # a zarr store on disk (opened read-only, chunks read lazily) -> identical
+    zarr = pytest.importorskip("zarr")
+    m = ArrayKey("MASK")
+    integ = compute_mask_integral(MaskSourceRandomLocation(m).data)
+    store = str(tmp_path / "mask_integral.zarr")
+    zarr.save_array(store, integ)
+
+    rl = RandomLocation(min_masked=0.5, mask=m, mask_integral=store)
+    src = MaskSourceRandomLocation(m)
+    with build(src + rl):
+        np.testing.assert_array_equal(np.asarray(rl.mask_integral[:]), integ)
+
+    stock = _run_masked_locations(RandomLocation(min_masked=0.5, mask=m), m)
+    zarred = _run_masked_locations(
+        RandomLocation(min_masked=0.5, mask=m, mask_integral=store), m
+    )
+    assert stock == zarred
